@@ -3,6 +3,8 @@
 
 let cols = { new:[], grad:[], done:[] };
 const CAP = { new:40, grad:30, done:30 };
+const GRAD_MIN = 0.30;       // Final Stretch: >= 30% to graduation (~$21K MC)
+const MIG_MIN_MC = 10000;    // Migrated: only rows with a validated real MC
 let searching = false;
 let priceBusy = false;
 
@@ -58,10 +60,12 @@ function onMigrate(d){
   t._new = Date.now();
   t.created = new Date().toISOString();
   t.progress = null; t.dex = 'pumpswap';
+  if(t.mc && t.mc < MIG_MIN_MC) t.mc = null;   // don't display drained-curve junk
   pushCol('done', t);
   cols.grad = cols.grad.filter(x=>x.mint!==t.mint); renderCol('grad');
   cols.new  = cols.new.filter(x=>x.mint!==t.mint);  renderCol('new');
-  setTimeout(async()=>{ try{ const f=remember(await fetchMints([t.mint])); if(f[0]){ Object.assign(t,f[0]); renderCol('done'); } }catch(e){} }, 6000);
+  const verify = async()=>{ try{ const f=remember(await fetchMints([t.mint])); if(f[0]&&f[0].mc>=MIG_MIN_MC){ Object.assign(t,f[0]); renderCol('done'); } }catch(e){} };
+  setTimeout(verify, 6000); setTimeout(verify, 20000);
 }
 function onTradeTick(d){
   const t = ppApply(d); if(!t) return;
@@ -69,6 +73,13 @@ function onTradeTick(d){
   flashCells(map);
   const pt=document.querySelector('[data-progtxt="'+t.mint+'"]');
   if(pt && t.progress!=null) pt.textContent = Math.round(t.progress*100)+'%';
+  // live promotion: crossed the graduation-run threshold -> Final Stretch
+  if(t.progress!=null && t.progress>=GRAD_MIN && !cols.grad.find(x=>x.mint===t.mint)){
+    t._new = Date.now();
+    cols.new = cols.new.filter(x=>x.mint!==t.mint); renderCol('new');
+    cols.grad = [t, ...cols.grad].sort((a,b)=>(b.progress||0)-(a.progress||0)).slice(0,CAP.grad);
+    renderCol('grad');
+  }
   if(S.positions[t.mint]){ S.positions[t.mint].priceSol=t.priceSol; S.positions[t.mint].priceUsd=t.priceUsd; renderDeck(); }
 }
 
@@ -77,15 +88,30 @@ async function seed(){
   await ensureSolUsd();
   const jobs = [
     loadNew().then(r=>{ if(!cols.new.length){ cols.new=r.slice(0,CAP.new); renderCol('new'); } }).catch(()=>{}),
-    loadGraduating().then(r=>{ cols.grad=r.slice(0,CAP.grad); renderCol('grad'); }).catch(()=>{}),
-    loadGraduated().then(r=>{ cols.done=r.slice(0,CAP.done); renderCol('done'); }).catch(()=>{})
+    loadGraduating().then(r=>{ cols.grad=r.filter(t=>t.progress>=GRAD_MIN).slice(0,CAP.grad); renderCol('grad'); }).catch(()=>{}),
+    loadGraduated().then(async r=>{
+      const needFix = r.filter(t=>!t.mc || t.mc<MIG_MIN_MC).map(t=>t.mint);
+      if(needFix.length){
+        try{
+          const fixed = remember(await fetchMints(needFix));
+          const fm={}; fixed.forEach(t=>fm[t.mint]=t);
+          r = r.map(t=>fm[t.mint]?Object.assign(t,fm[t.mint]):t);
+        }catch(e){}
+      }
+      cols.done = r.filter(t=>t.mc>=MIG_MIN_MC).slice(0,CAP.done);
+      renderCol('done');
+    }).catch(()=>{})
   ];
   await Promise.all(jobs);
   remember([...cols.new,...cols.grad,...cols.done]);
   wsSubTrades([...cols.new,...cols.grad,...cols.done].map(t=>t.mint), onTradeTick);
 }
 async function backfill(){
-  try{ const r=remember(await loadGraduating()); cols.grad=r.slice(0,CAP.grad); renderCol('grad'); wsSubTrades(cols.grad.map(t=>t.mint)); }catch(e){}
+  try{
+    const r=remember(await loadGraduating());
+    cols.grad=r.filter(t=>t.progress>=GRAD_MIN).slice(0,CAP.grad);
+    renderCol('grad'); wsSubTrades(cols.grad.map(t=>t.mint));
+  }catch(e){}
 }
 async function pollPrices(){
   if(priceBusy) return; priceBusy=true;
