@@ -3,8 +3,8 @@
 
 let cols = { new:[], grad:[], done:[] };
 const CAP = { new:40, grad:30, done:30 };
-const GRAD_MIN = 0.30;       // Final Stretch: >= 30% to graduation (~$21K MC)
-const MIG_MIN_MC = 10000;    // Migrated: only rows with a validated real MC
+const GRAD_MIN = 0.40;       // Final Stretch: >= 40% along the bonding curve
+const MIG_MIN_MC = 5000;     // Migrated: minimum believable market cap
 let searching = false;
 let priceBusy = false;
 
@@ -77,7 +77,8 @@ function onTradeTick(d){
   if(t.progress!=null && t.progress>=GRAD_MIN && !cols.grad.find(x=>x.mint===t.mint)){
     t._new = Date.now();
     cols.new = cols.new.filter(x=>x.mint!==t.mint); renderCol('new');
-    cols.grad = [t, ...cols.grad].sort((a,b)=>(b.progress||0)-(a.progress||0)).slice(0,CAP.grad);
+    cols.grad = [t, ...cols.grad.filter(x=>x.mint!==t.mint)]
+                  .sort((a,b)=>(b.progress||0)-(a.progress||0)).slice(0,CAP.grad);
     renderCol('grad');
   }
   if(S.positions[t.mint]){ S.positions[t.mint].priceSol=t.priceSol; S.positions[t.mint].priceUsd=t.priceUsd; renderDeck(); }
@@ -122,7 +123,15 @@ async function pollPrices(){
       const fresh = remember(await fetchMints([...need].slice(0,30)));
       const map={}; fresh.forEach(t=>map[t.mint]=t);
       for(const m in S.positions){ if(map[m]){ S.positions[m].priceSol=map[m].priceSol; S.positions[m].priceUsd=map[m].priceUsd; } }
-      flashCells(map); renderDeck();
+      flashCells(map);
+      // merge fresh values in, then drop anything that still has no believable cap
+      cols.done = cols.done.map(t=>map[t.mint]?Object.assign(t,map[t.mint]):t)
+                           .filter(t=>t.mc>=MIG_MIN_MC);
+      cols.grad = cols.grad.map(t=>map[t.mint]?Object.assign(t,map[t.mint]):t)
+                           .filter(t=>t.progress==null||t.progress>=GRAD_MIN*0.75)
+                           .sort((a,b)=>(b.progress||0)-(a.progress||0));
+      renderCol('done'); renderCol('grad');
+      renderDeck();
     }
   }catch(e){}
   priceBusy=false;
