@@ -176,3 +176,18 @@ input:focus{outline:2px solid var(--brand);outline-offset:1px}
 .ph{font-size:.72rem;letter-spacing:.08em;color:var(--brand2);margin:0 0 .5rem}
 @media (max-width:900px){ .pgrid{grid-template-columns:1fr} }
 @media (prefers-reduced-motion:reduce){ .livedot,.fl-up,.fl-down,.newrow{animation:none} }
+
+/* ---------- v6: three-column Pulse ---------- */
+.pulsebar{display:flex;align-items:center;gap:.6rem;padding:0 0 12px}
+.pulse{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;align-items:start}
+.pulse-col{height:calc(100vh - 150px);min-height:400px}
+.colbody{padding:0 !important;overflow-y:auto}
+.colcount{font-family:'JetBrains Mono',monospace;font-size:.65rem;color:var(--muted);border:1px solid var(--line);border-radius:5px;padding:.08rem .4rem}
+.pulse .tok{grid-template-columns:30px 1fr auto auto;padding:.5rem .7rem}
+.pulse .tok img,.pulse .noimg{width:30px;height:30px}
+.pulse .sym{font-size:.82rem}
+.pulse .px{font-size:.74rem}
+@media (max-width:1100px){
+  .pulse{grid-template-columns:1fr}
+  .pulse-col{height:auto;max-height:70vh}
+}
