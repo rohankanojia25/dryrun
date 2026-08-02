@@ -11,7 +11,20 @@ const GT  = 'https://api.geckoterminal.com/api/v2';
 const KEY = 'dryrun:v1';
 const FEE = 0.01;
 const NETFEE = 0.0005;
-const GRAD_MC = 69000;
+const GRAD_MC_SOL = 345;     // pump.fun graduates at ~345 SOL market cap (the invariant)
+const CURVE_START = 30;      // virtual SOL reserves at launch
+const CURVE_END   = 85;      // real SOL in curve at graduation
+function gradMcUsd(){ return solUsd ? GRAD_MC_SOL*solUsd : 25000; }
+/* progress: exact from curve reserves when the stream gives them, else from market cap */
+function calcProgress(t){
+  if(t.vSol>0){
+    return Math.max(0, Math.min((t.vSol-CURVE_START)/(CURVE_END-CURVE_START), 1));
+  }
+  if(t.mcSol>0) return Math.min(t.mcSol/GRAD_MC_SOL, 1);
+  if(t.mc>0) return Math.min(t.mc/gradMcUsd(), 1);
+  return null;
+}
+function onCurveToken(t){ return /pump/.test(t.dex||'') && !/swap/.test(t.dex||''); }
 
 let S = { wallet:null, flow:0, lastBal:null, positions:{}, history:[], realized:0 };
 let known = {};
@@ -141,6 +154,16 @@ async function airdrop(){
 }
 
 /* ---------------- market data ---------------- */
+const PUMP_SUPPLY = 1e9;   // pump.fun mints a fixed 1B supply
+const MC_FLOOR = 500;      // anything below this is a drained curve / half-synced pool
+function fixMc(t){
+  if(!t) return t;
+  if((!t.mc || t.mc < MC_FLOOR) && t.priceUsd > 0) t.mc = t.priceUsd * PUMP_SUPPLY;
+  if(t.mc && t.mc < MC_FLOOR) t.mc = 0;
+  if(t.mc && solUsd) t.mcSol = t.mc/solUsd;
+  if(onCurveToken(t)) t.progress = calcProgress(t);   // recompute every update, never stale
+  return t;
+}
 function remember(list){ list.forEach(t=>{ known[t.mint]=Object.assign(known[t.mint]||{}, t); }); return list; }
 function normDS(pairs){
   const by={};
@@ -157,9 +180,9 @@ function normDS(pairs){
     const priceSol = isSolQuote ? (+p.priceNative||0) : (solUsd? priceUsd/solUsd : 0);
     return { mint:p.baseToken.address, symbol:p.baseToken.symbol||'?', name:p.baseToken.name||'',
       img:p.info?.imageUrl||'', priceUsd, priceSol, chg1:p.priceChange?.h1, chg24:p.priceChange?.h24,
-      vol24:p.volume?.h24, liq:p.liquidity?.usd, mc:p.marketCap||p.fdv, pair:p.pairAddress,
+      vol24:p.volume?.h24, liq:p.liquidity?.usd, mc:+p.marketCap||+p.fdv||0, pair:p.pairAddress,
       created:p.pairCreatedAt, progress:null, dex:p.dexId };
-  });
+  }).map(fixMc);
 }
 function normGT(j){
   const inc = {}; (j.included||[]).forEach(t=>inc[t.id]=t.attributes||{});
@@ -174,17 +197,17 @@ function normGT(j){
     const priceUsd = +a.base_token_price_usd || 0;
     const priceSol = +a.base_token_price_native_currency || 0;
     if(priceUsd && priceSol) solUsd = priceUsd/priceSol;
-    let mc = +a.market_cap_usd || +a.fdv_usd || 0;
-    if(mc < 1000) mc = 0;   // junk / still-syncing values
+    const mc = +a.market_cap_usd || +a.fdv_usd || 0;
     const onCurve = /pump/.test(dex) && !/swap/.test(dex);
     out.push({ mint, symbol: tk.symbol || (a.name||'').split(' /')[0] || '?', name: tk.name||'',
       img: tk.image_url && tk.image_url!=='missing.png' ? tk.image_url : '',
       priceUsd, priceSol, chg1:+(a.price_change_percentage?.h1)||null, chg24:+(a.price_change_percentage?.h24)||null,
       vol24:+(a.volume_usd?.h24)||0, liq:+a.reserve_in_usd||0, mc, pair:a.address,
       created:a.pool_created_at, dex,
-      progress: onCurve && mc ? Math.min(mc/GRAD_MC,1) : null });
+      progress: null });
   }
-  const seen={}; return out.filter(t=> seen[t.mint]?false:(seen[t.mint]=1));
+  const seen={};
+  return out.filter(t=> seen[t.mint]?false:(seen[t.mint]=1)).map(fixMc);
 }
 async function gtFetch(path){
   const r = await fetch(GT+path, {headers:{'Accept':'application/json'}});
@@ -198,12 +221,17 @@ async function loadNew(){
   return (fresh.length?fresh:all).sort((a,b)=>new Date(b.created)-new Date(a.created));
 }
 async function loadGraduating(){
-  let j=null;
+  let dex=null;
   for(const d of ['pump-fun','pumpfun']){
-    try{ j = await gtFetch('/networks/solana/dexes/'+d+'/pools?include=base_token&page=1'); break; }catch(e){}
+    try{ await gtFetch('/networks/solana/dexes/'+d+'/pools?include=base_token&page=1'); dex=d; break; }catch(e){}
   }
-  if(!j) throw new Error('pump.fun pools unavailable');
-  return normGT(j).filter(t=>t.progress!=null).sort((a,b)=>b.progress-a.progress);
+  if(!dex) throw new Error('pump.fun pools unavailable');
+  const pages = await Promise.all([1,2,3].map(p=>
+    gtFetch('/networks/solana/dexes/'+dex+'/pools?include=base_token&page='+p).then(normGT).catch(()=>[])
+  ));
+  const all=[], seen={};
+  pages.flat().forEach(t=>{ if(!seen[t.mint]){ seen[t.mint]=1; all.push(t); } });
+  return all.filter(t=>t.progress!=null).sort((a,b)=>b.progress-a.progress);
 }
 async function loadGraduated(){
   const j = await gtFetch('/networks/solana/new_pools?include=base_token&page=1');
@@ -249,11 +277,13 @@ function flashCells(map){
     const prevP = lastPrice[m], prevM = lastMc[m];
     const pxUp = prevP!=null && t.priceUsd!==prevP ? t.priceUsd>prevP : null;
     const mcUp = prevM!=null && t.mc && t.mc!==prevM ? t.mc>prevM : null;
+    fixMc(t);
     document.querySelectorAll('[data-px="'+m+'"]').forEach(el=>{
       const isMc = el.dataset.mode==='mc';
       const moved = isMc ? (mcUp!=null?mcUp:pxUp) : pxUp;
       if(moved!=null) flashOne(el, moved);
-      el.textContent = isMc && t.mc ? money(t.mc)+' MC' : '$'+fmt(t.priceUsd);
+      el.textContent = (isMc && t.mc>=MC_FLOOR) ? money(t.mc)+' MC'
+                     : (t.priceUsd>0 ? '$'+fmt(t.priceUsd) : '—');
     });
     document.querySelectorAll('[data-chg="'+m+'"]').forEach(el=>{
       const v = t.chg1!=null?t.chg1:t.chg24;
@@ -381,13 +411,12 @@ function ppApply(d){
   if(d.name) t.name=d.name;
   if(!t.pair && d.bondingCurveKey) t.pair=d.bondingCurveKey;
   const vS=+d.vSolInBondingCurve, vT=+d.vTokensInBondingCurve;
+  if(vS>0) t.vSol = vS;
   if(vS>0 && vT>0) t.priceSol = vS/vT;
-  const mcSol = +d.marketCapSol;
-  if(mcSol > 1){   // ignore drained-curve dust that produced fake $0.03 caps
-    t.mcSol = mcSol;
-    if(solUsd){ t.mc = t.mcSol*solUsd; if(/pump/.test(t.dex)&&!/swap/.test(t.dex)) t.progress = Math.min(t.mc/GRAD_MC,1); }
-  }
   if(t.priceSol && solUsd) t.priceUsd = t.priceSol*solUsd;
+  const mcSol = +d.marketCapSol;
+  if(mcSol > 1){ t.mcSol = mcSol; if(solUsd) t.mc = mcSol*solUsd; }
+  fixMc(t);
   return t;
 }
 /* lazy-load a new token's image from its metadata uri */
