@@ -174,7 +174,8 @@ function normGT(j){
     const priceUsd = +a.base_token_price_usd || 0;
     const priceSol = +a.base_token_price_native_currency || 0;
     if(priceUsd && priceSol) solUsd = priceUsd/priceSol;
-    const mc = +a.market_cap_usd || +a.fdv_usd || 0;
+    let mc = +a.market_cap_usd || +a.fdv_usd || 0;
+    if(mc < 1000) mc = 0;   // junk / still-syncing values
     const onCurve = /pump/.test(dex) && !/swap/.test(dex);
     out.push({ mint, symbol: tk.symbol || (a.name||'').split(' /')[0] || '?', name: tk.name||'',
       img: tk.image_url && tk.image_url!=='missing.png' ? tk.image_url : '',
@@ -381,8 +382,9 @@ function ppApply(d){
   if(!t.pair && d.bondingCurveKey) t.pair=d.bondingCurveKey;
   const vS=+d.vSolInBondingCurve, vT=+d.vTokensInBondingCurve;
   if(vS>0 && vT>0) t.priceSol = vS/vT;
-  if(d.marketCapSol){
-    t.mcSol=+d.marketCapSol;
+  const mcSol = +d.marketCapSol;
+  if(mcSol > 1){   // ignore drained-curve dust that produced fake $0.03 caps
+    t.mcSol = mcSol;
     if(solUsd){ t.mc = t.mcSol*solUsd; if(/pump/.test(t.dex)&&!/swap/.test(t.dex)) t.progress = Math.min(t.mc/GRAD_MC,1); }
   }
   if(t.priceSol && solUsd) t.priceUsd = t.priceSol*solUsd;
