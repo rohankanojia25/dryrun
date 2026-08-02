@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DryRun · Practice Solana memecoin trading</title>
+<meta name="description" content="Trade live Solana memecoins with devnet SOL. Real market data, real wallet, zero real money. Practice before you jump to mainnet.">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tweetnacl/1.0.3/nacl.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@600;700&family=Space+Grotesk:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+
+<header id="deck">
+  <span id="logo">DRY<b>RUN</b></span>
+  <span class="sim-strip">▲ PRACTICE MODE · NO REAL MONEY</span>
+  <div class="deck-stat"><span class="k">SOL / USD</span><span class="v" id="solusd">–</span></div>
+  <div class="deck-stat"><span class="k">Network</span><span class="v"><span class="dot" id="netdot"></span>devnet</span></div>
+  <span class="spacer"></span>
+  <div id="walletzone"></div>
+</header>
+
+<main id="app"></main>
+<div id="toasts"></div>
+
+<script src="js/app.js"></script>
+</body>
+</html>
