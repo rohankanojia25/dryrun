@@ -11,7 +11,7 @@ const GT  = 'https://api.geckoterminal.com/api/v2';
 const KEY = 'dryrun:v1';
 const FEE = 0.01;
 const NETFEE = 0.0005;
-const GRAD_MC_SOL = 345;     // pump.fun graduates at ~345 SOL market cap (the invariant)
+const GRAD_MC_SOL = 460;     // pump.fun graduation ~460 SOL market cap (scales with SOL price)
 const CURVE_START = 30;      // virtual SOL reserves at launch
 const CURVE_END   = 85;      // real SOL in curve at graduation
 function gradMcUsd(){ return solUsd ? GRAD_MC_SOL*solUsd : 25000; }
@@ -161,8 +161,25 @@ function fixMc(t){
   if((!t.mc || t.mc < MC_FLOOR) && t.priceUsd > 0) t.mc = t.priceUsd * PUMP_SUPPLY;
   if(t.mc && t.mc < MC_FLOOR) t.mc = 0;
   if(t.mc && solUsd) t.mcSol = t.mc/solUsd;
-  if(onCurveToken(t)) t.progress = calcProgress(t);   // recompute every update, never stale
+  if(onCurveToken(t)){
+    const p = calcProgress(t);
+    // a listed on-curve token by definition hasn't graduated: cap the bar below 100
+    t.progress = p==null ? null : Math.min(p, 0.99);
+  }
   return t;
+}
+/* Merge fresh data into an existing token without letting a weaker source
+   overwrite bonding-curve figures. GeckoTerminal + the websocket own on-curve
+   market caps; DexScreener owns migrated pools and plain prices. */
+function mergeToken(dst, src){
+  if(!dst) return src;
+  const onCurve = onCurveToken(dst);
+  const keepMc = onCurve && src.src==='ds';       // ignore DS caps for curve tokens
+  const mc = keepMc ? dst.mc : (src.mc || dst.mc);
+  const prog = keepMc ? dst.progress : dst.progress;
+  Object.assign(dst, src);
+  if(keepMc){ dst.mc = mc; dst.progress = prog; dst.dex = dst.dex||src.dex; }
+  return fixMc(dst);
 }
 function remember(list){ list.forEach(t=>{ known[t.mint]=Object.assign(known[t.mint]||{}, t); }); return list; }
 function normDS(pairs){
@@ -181,7 +198,7 @@ function normDS(pairs){
     return { mint:p.baseToken.address, symbol:p.baseToken.symbol||'?', name:p.baseToken.name||'',
       img:p.info?.imageUrl||'', priceUsd, priceSol, chg1:p.priceChange?.h1, chg24:p.priceChange?.h24,
       vol24:p.volume?.h24, liq:p.liquidity?.usd, mc:+p.marketCap||+p.fdv||0, pair:p.pairAddress,
-      created:p.pairCreatedAt, progress:null, dex:p.dexId };
+      created:p.pairCreatedAt, progress:null, dex:p.dexId, src:'ds' };
   }).map(fixMc);
 }
 function normGT(j){
@@ -204,7 +221,7 @@ function normGT(j){
       priceUsd, priceSol, chg1:+(a.price_change_percentage?.h1)||null, chg24:+(a.price_change_percentage?.h24)||null,
       vol24:+(a.volume_usd?.h24)||0, liq:+a.reserve_in_usd||0, mc, pair:a.address,
       created:a.pool_created_at, dex,
-      progress: null });
+      progress: null, src:'gt' });
   }
   const seen={};
   return out.filter(t=> seen[t.mint]?false:(seen[t.mint]=1)).map(fixMc);
@@ -234,14 +251,17 @@ async function loadGraduating(){
   return all.filter(t=>t.progress!=null).sort((a,b)=>b.progress-a.progress);
 }
 async function loadGraduated(){
-  const j = await gtFetch('/networks/solana/new_pools?include=base_token&page=1');
-  let mig = normGT(j).filter(t=>/pumpswap|raydium|meteora|orca/.test(t.dex));
-  if(mig.length<5){
-    try{
-      const j2 = await gtFetch('/networks/solana/dexes/pumpswap/pools?include=base_token&page=1');
-      mig = mig.concat(normGT(j2).filter(x=>!mig.find(y=>y.mint===x.mint)));
-    }catch(e){}
-  }
+  // paged pumpswap pools give a real backlog; new_pools alone is only a ~20-pool sliding window
+  const pages = await Promise.all([1,2,3].map(p=>
+    gtFetch('/networks/solana/dexes/pumpswap/pools?include=base_token&page='+p).then(normGT).catch(()=>[])
+  ));
+  let mig=[], seen={};
+  pages.flat().forEach(t=>{ if(!seen[t.mint]){ seen[t.mint]=1; mig.push(t); } });
+  try{
+    const j = await gtFetch('/networks/solana/new_pools?include=base_token&page=1');
+    normGT(j).filter(t=>/pumpswap|raydium|meteora|orca/.test(t.dex))
+             .forEach(t=>{ if(!seen[t.mint]){ seen[t.mint]=1; mig.push(t); } });
+  }catch(e){}
   return mig.sort((a,b)=>new Date(b.created)-new Date(a.created));
 }
 async function loadHot(){
@@ -406,7 +426,7 @@ function wsSubTrades(mints, fn){
 /* map a pumpportal message onto our token model */
 function ppApply(d){
   const m=d.mint; if(!m) return null;
-  const t = known[m] = known[m] || {mint:m, symbol:d.symbol||'?', name:d.name||'', img:'', pair:d.bondingCurveKey||'', dex:'pump-fun'};
+  const t = known[m] = known[m] || {mint:m, symbol:d.symbol||'?', name:d.name||'', img:'', pair:d.bondingCurveKey||'', dex:'pump-fun', src:'ws'};
   if(d.symbol) t.symbol=d.symbol;
   if(d.name) t.name=d.name;
   if(!t.pair && d.bondingCurveKey) t.pair=d.bondingCurveKey;
