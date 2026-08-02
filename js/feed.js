@@ -1,459 +1,269 @@
-/* ================================================================
-   DryRun · core.js (shared by all pages)
-   index.html      token feed (new / graduating / graduated / hot)
-   token.html      trade page  (?mint=...&pair=...)
-   portfolio.html  wallet, positions, history
-   ================================================================ */
+/* DryRun · feed.js — index.html · three-column Pulse (New Pairs | Final Stretch | Migrated)
+   Streams from PumpPortal websocket, seeded and backfilled by GeckoTerminal/DexScreener. */
 
-const RPC = 'https://api.devnet.solana.com';
-const DS  = 'https://api.dexscreener.com';
-const GT  = 'https://api.geckoterminal.com/api/v2';
-const KEY = 'dryrun:v1';
-const FEE = 0.01;
-const NETFEE = 0.0005;
-const GRAD_MC_SOL = 460;     // pump.fun graduation ~460 SOL market cap (scales with SOL price)
-const CURVE_START = 30;      // virtual SOL reserves at launch
-const CURVE_END   = 85;      // real SOL in curve at graduation
-function gradMcUsd(){ return solUsd ? GRAD_MC_SOL*solUsd : 25000; }
-/* progress: exact from curve reserves when the stream gives them, else from market cap */
-function calcProgress(t){
-  if(t.vSol>0){
-    return Math.max(0, Math.min((t.vSol-CURVE_START)/(CURVE_END-CURVE_START), 1));
-  }
-  if(t.mcSol>0) return Math.min(t.mcSol/GRAD_MC_SOL, 1);
-  if(t.mc>0) return Math.min(t.mc/gradMcUsd(), 1);
-  return null;
-}
-function onCurveToken(t){ return /pump/.test(t.dex||'') && !/swap/.test(t.dex||''); }
+let cols = { new:[], grad:[], done:[] };
+const CAP = { new:40, grad:30, done:30 };
+const NEW_MIN_MC = 5000;     // New Pairs: only mints that trade above this market cap
+const GRAD_MIN = 0.40;       // Final Stretch: >= 40% along the bonding curve
+const MIG_MIN_MC = 5000;     // Migrated: minimum believable market cap
+let searching = false;
+let priceBusy = false;
+let pending = new Map();     // fresh mints below the floor, watched until they cross it
+const MIG_KEY = 'dryrun:migrated';
+const MIG_TTL = 48*3600*1000;   // remember migrations for 2 days
 
-let S = { wallet:null, flow:0, lastBal:null, positions:{}, history:[], realized:0 };
-let known = {};
-let solUsd = 0;
-let devnetBal = null;
-let lastTick = Date.now();
-let lastPrice = {};
-let lastMc = {};
-
-/* Trading balance = on-chain devnet SOL + cumulative trade flow (sells - buys).
-   The airdrop raises it automatically via the on-chain balance. No separate ledger. */
-function cash(){
-  const base = devnetBal!=null ? devnetBal : (S.lastBal!=null ? S.lastBal : 0);
-  return Math.max(base + (S.flow||0), 0);
-}
-
-/* ---------------- utils ---------------- */
-const $ = s => document.querySelector(s);
-const ALPH='123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-function b58(bytes){
-  let n=0n; for(const b of bytes) n = n*256n + BigInt(b);
-  let s=''; while(n>0n){ s = ALPH[Number(n%58n)] + s; n/=58n; }
-  for(const b of bytes){ if(b===0) s='1'+s; else break; }
-  return s || '1';
-}
-function b58d(str){
-  let n=0n;
-  for(const c of str){ const i=ALPH.indexOf(c); if(i<0) throw new Error('Invalid character in key'); n=n*58n+BigInt(i); }
-  const bytes=[]; while(n>0n){ bytes.unshift(Number(n&255n)); n>>=8n; }
-  for(const c of str){ if(c==='1') bytes.unshift(0); else break; }
-  return new Uint8Array(bytes);
-}
-function fmt(n, d){ if(n==null||isNaN(n)) return '–';
-  if(d!=null) return Number(n).toLocaleString('en-US',{maximumFractionDigits:d});
-  const a=Math.abs(n);
-  return Number(n).toLocaleString('en-US',{maximumFractionDigits: a>=1000?0 : a>=1?2 : a>=0.001?5 : 9});
-}
-function money(n){ if(n==null||isNaN(n)) return '–';
-  const a=Math.abs(n);
-  if(a>=1e9) return '$'+(n/1e9).toFixed(2)+'B';
-  if(a>=1e6) return '$'+(n/1e6).toFixed(2)+'M';
-  if(a>=1e3) return '$'+(n/1e3).toFixed(1)+'K';
-  return '$'+fmt(n,2);
-}
-function age(ts){ if(!ts) return '';
-  const s=(Date.now()-new Date(ts).getTime())/1000;
-  if(s<60) return Math.max(1,s|0)+'s';
-  if(s<3600) return (s/60|0)+'m';
-  if(s<86400) return (s/3600|0)+'h';
-  return (s/86400|0)+'d';
-}
-function toast(msg, cls){ const t=document.createElement('div'); t.className='toast '+(cls||'');
-  t.innerHTML=msg; $('#toasts').appendChild(t); setTimeout(()=>t.remove(), 5200); }
-function esc(s){ return String(s??'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function chgCell(v){ if(v==null||isNaN(v)) return '<span class="chg">–</span>';
-  return `<span class="chg ${v>=0?'pos-chg':'neg-chg'}">${v>=0?'+':''}${fmt(v,1)}%</span>`; }
-
-/* ---------------- persistence ---------------- */
-async function save(){
-  const raw = JSON.stringify(S);
-  try{ if(window.storage){ await window.storage.set(KEY, raw); } }catch(e){}
-  try{ localStorage.setItem(KEY, raw); }catch(e){}
-}
-async function loadState(){
-  let raw=null;
-  try{ if(window.storage){ const r=await window.storage.get(KEY); raw=r&&r.value; } }catch(e){}
-  if(!raw){ try{ raw=localStorage.getItem(KEY); }catch(e){} }
-  if(raw){ try{
-    S = Object.assign(S, JSON.parse(raw));
-    if(typeof S.flow!=='number') S.flow = 0;   // migrate from old cash-ledger versions
-  }catch(e){} }
-}
-
-/* ---------------- Solana devnet ---------------- */
-async function rpc(method, params){
-  const r = await fetch(RPC,{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({jsonrpc:'2.0',id:1,method,params})});
-  const j = await r.json();
-  if(j.error) throw new Error(j.error.message||'RPC error');
-  return j.result;
-}
-async function refreshBalance(){
-  if(!S.wallet) return;
+function saveMigrated(){
   try{
-    const res = await rpc('getBalance',[S.wallet.address]);
-    devnetBal = res.value/1e9;
-    if(S.lastBal!==devnetBal){ S.lastBal = devnetBal; save(); }
-    $('#netdot')?.classList.add('on');
-  }catch(e){ $('#netdot')?.classList.remove('on'); }
-  renderDeck();
-}
-function makeWallet(){
-  const kp = nacl.sign.keyPair();
-  S.wallet = { address: b58(kp.publicKey), secret: Array.from(kp.secretKey) };
-  S.flow = 0; S.lastBal = null; S.positions={}; S.history=[]; S.realized=0;
-  save();
-}
-function exportKey(){
-  if(!S.wallet) return;
-  const k = b58(Uint8Array.from(S.wallet.secret));
-  navigator.clipboard.writeText(k).then(()=>toast('<b>Secret key copied.</b> Store it safely. Paste it on any device to restore this wallet. Practice wallet only — never fund it with real SOL.','ok'));
-}
-function importKey(){
-  const k = prompt('Paste your DryRun secret key (base58). This restores that wallet on this device.');
-  if(!k) return;
-  try{
-    const sk = b58d(k.trim());
-    if(sk.length!==64) throw new Error('Key must decode to 64 bytes');
-    const kp = nacl.sign.keyPair.fromSecretKey(sk);
-    S.wallet = { address: b58(kp.publicKey), secret: Array.from(sk) };
-    save(); refreshBalance();
-    toast('<b>Wallet restored:</b> '+S.wallet.address.slice(0,4)+'…'+S.wallet.address.slice(-4),'ok');
-    setTimeout(()=>location.href='index.html', 900);
-  }catch(e){ toast('<b>Import failed:</b> '+esc(e.message),'err'); }
-}
-async function airdrop(){
-  const btn=$('#airdropbtn'); if(btn){btn.disabled=true;btn.textContent='Requesting…';}
-  try{
-    await rpc('requestAirdrop',[S.wallet.address, 1e9]);
-    toast('<b>1 devnet SOL claimed.</b> Your trading balance rises as soon as it confirms on-chain (a few seconds).','ok');
-    setTimeout(refreshBalance, 4000); setTimeout(refreshBalance, 12000);
-  }catch(e){
-    toast('<b>Faucet declined:</b> '+esc(e.message)+'<br>The public devnet faucet is rate-limited and often dry. Try again shortly, or paste your address at <b>faucet.solana.com</b>.','err');
-  }
-  if(btn){btn.disabled=false;btn.textContent='Claim 1 devnet SOL';}
-  renderDeck();
-}
-
-/* ---------------- market data ---------------- */
-const PUMP_SUPPLY = 1e9;   // pump.fun mints a fixed 1B supply
-const MC_FLOOR = 500;      // anything below this is a drained curve / half-synced pool
-function fixMc(t){
-  if(!t) return t;
-  if((!t.mc || t.mc < MC_FLOOR) && t.priceUsd > 0) t.mc = t.priceUsd * PUMP_SUPPLY;
-  if(t.mc && t.mc < MC_FLOOR) t.mc = 0;
-  if(t.mc && solUsd) t.mcSol = t.mc/solUsd;
-  if(onCurveToken(t)){
-    const p = calcProgress(t);
-    // a listed on-curve token by definition hasn't graduated: cap the bar below 100
-    t.progress = p==null ? null : Math.min(p, 0.99);
-  }
-  return t;
-}
-/* Merge fresh data into an existing token without letting a weaker source
-   overwrite bonding-curve figures. GeckoTerminal + the websocket own on-curve
-   market caps; DexScreener owns migrated pools and plain prices. */
-function mergeToken(dst, src){
-  if(!dst) return src;
-  const onCurve = onCurveToken(dst);
-  const keepMc = onCurve && src.src==='ds';       // ignore DS caps for curve tokens
-  const mc = keepMc ? dst.mc : (src.mc || dst.mc);
-  const prog = keepMc ? dst.progress : dst.progress;
-  Object.assign(dst, src);
-  if(keepMc){ dst.mc = mc; dst.progress = prog; dst.dex = dst.dex||src.dex; }
-  return fixMc(dst);
-}
-function remember(list){ list.forEach(t=>{ known[t.mint]=Object.assign(known[t.mint]||{}, t); }); return list; }
-function normDS(pairs){
-  const by={};
-  for(const p of pairs||[]){
-    if(p.chainId!=='solana') continue;
-    const m=p.baseToken?.address; if(!m) continue;
-    const liq=p.liquidity?.usd||0;
-    if(!by[m] || liq>(by[m].liquidity?.usd||0)) by[m]=p;
-  }
-  return Object.values(by).map(p=>{
-    const isSolQuote = /SOL/i.test(p.quoteToken?.symbol||'');
-    if(isSolQuote && p.priceUsd && p.priceNative) solUsd = (+p.priceUsd)/(+p.priceNative);
-    const priceUsd = +p.priceUsd || 0;
-    const priceSol = isSolQuote ? (+p.priceNative||0) : (solUsd? priceUsd/solUsd : 0);
-    return { mint:p.baseToken.address, symbol:p.baseToken.symbol||'?', name:p.baseToken.name||'',
-      img:p.info?.imageUrl||'', priceUsd, priceSol, chg1:p.priceChange?.h1, chg24:p.priceChange?.h24,
-      vol24:p.volume?.h24, liq:p.liquidity?.usd, mc:+p.marketCap||+p.fdv||0, pair:p.pairAddress,
-      created:p.pairCreatedAt, progress:null, dex:p.dexId, src:'ds' };
-  }).map(fixMc);
-}
-function normGT(j){
-  const inc = {}; (j.included||[]).forEach(t=>inc[t.id]=t.attributes||{});
-  const out = [];
-  for(const pool of j.data||[]){
-    const a = pool.attributes||{};
-    const tokId = pool.relationships?.base_token?.data?.id||'';
-    const mint = tokId.replace(/^solana_/,'');
-    if(!mint || mint.length<32) continue;
-    const tk = inc[tokId]||{};
-    const dex = pool.relationships?.dex?.data?.id||'';
-    const priceUsd = +a.base_token_price_usd || 0;
-    const priceSol = +a.base_token_price_native_currency || 0;
-    if(priceUsd && priceSol) solUsd = priceUsd/priceSol;
-    const mc = +a.market_cap_usd || +a.fdv_usd || 0;
-    const onCurve = /pump/.test(dex) && !/swap/.test(dex);
-    out.push({ mint, symbol: tk.symbol || (a.name||'').split(' /')[0] || '?', name: tk.name||'',
-      img: tk.image_url && tk.image_url!=='missing.png' ? tk.image_url : '',
-      priceUsd, priceSol, chg1:+(a.price_change_percentage?.h1)||null, chg24:+(a.price_change_percentage?.h24)||null,
-      vol24:+(a.volume_usd?.h24)||0, liq:+a.reserve_in_usd||0, mc, pair:a.address,
-      created:a.pool_created_at, dex,
-      progress: null, src:'gt' });
-  }
-  const seen={};
-  return out.filter(t=> seen[t.mint]?false:(seen[t.mint]=1)).map(fixMc);
-}
-async function gtFetch(path){
-  const r = await fetch(GT+path, {headers:{'Accept':'application/json'}});
-  if(!r.ok) throw new Error('GeckoTerminal '+r.status);
-  return r.json();
-}
-async function loadNew(){
-  const j = await gtFetch('/networks/solana/new_pools?include=base_token&page=1');
-  const all = normGT(j);
-  const fresh = all.filter(t=>/pump/.test(t.dex) && !/swap/.test(t.dex));
-  return (fresh.length?fresh:all).sort((a,b)=>new Date(b.created)-new Date(a.created));
-}
-async function loadGraduating(){
-  let dex=null;
-  for(const d of ['pump-fun','pumpfun']){
-    try{ await gtFetch('/networks/solana/dexes/'+d+'/pools?include=base_token&page=1'); dex=d; break; }catch(e){}
-  }
-  if(!dex) throw new Error('pump.fun pools unavailable');
-  const pages = await Promise.all([1,2,3].map(p=>
-    gtFetch('/networks/solana/dexes/'+dex+'/pools?include=base_token&page='+p).then(normGT).catch(()=>[])
-  ));
-  const all=[], seen={};
-  pages.flat().forEach(t=>{ if(!seen[t.mint]){ seen[t.mint]=1; all.push(t); } });
-  return all.filter(t=>t.progress!=null).sort((a,b)=>b.progress-a.progress);
-}
-async function loadGraduated(){
-  // paged pumpswap pools give a real backlog; new_pools alone is only a ~20-pool sliding window
-  const pages = await Promise.all([1,2,3].map(p=>
-    gtFetch('/networks/solana/dexes/pumpswap/pools?include=base_token&page='+p).then(normGT).catch(()=>[])
-  ));
-  let mig=[], seen={};
-  pages.flat().forEach(t=>{ if(!seen[t.mint]){ seen[t.mint]=1; mig.push(t); } });
-  try{
-    const j = await gtFetch('/networks/solana/new_pools?include=base_token&page=1');
-    normGT(j).filter(t=>/pumpswap|raydium|meteora|orca/.test(t.dex))
-             .forEach(t=>{ if(!seen[t.mint]){ seen[t.mint]=1; mig.push(t); } });
+    const slim = cols.done.slice(0,CAP.done).map(t=>({
+      mint:t.mint, symbol:t.symbol, name:t.name, img:t.img, pair:t.pair, dex:t.dex,
+      mc:t.mc, priceUsd:t.priceUsd, priceSol:t.priceSol, chg1:t.chg1, chg24:t.chg24,
+      created:t.created, seen:t.seen||Date.now(), src:t.src
+    }));
+    localStorage.setItem(MIG_KEY, JSON.stringify(slim));
   }catch(e){}
-  return mig.sort((a,b)=>new Date(b.created)-new Date(a.created));
 }
-async function loadHot(){
+function loadMigrated(){
   try{
-    const j = await gtFetch('/networks/solana/trending_pools?include=base_token&page=1');
-    const t = normGT(j); if(t.length) return t;
-  }catch(e){}
-  const boosts = await (await fetch(DS+'/token-boosts/top/v1')).json();
-  const addrs = [...new Set(boosts.filter(b=>b.chainId==='solana').map(b=>b.tokenAddress))].slice(0,30);
-  if(!addrs.length) return [];
-  const pairs = await (await fetch(DS+'/tokens/v1/solana/'+addrs.join(','))).json();
-  return normDS(pairs);
-}
-async function fetchSearch(q){
-  const j = await (await fetch(DS+'/latest/dex/search?q='+encodeURIComponent(q))).json();
-  return normDS(j.pairs);
-}
-async function fetchMints(mints){
-  if(!mints.length) return [];
-  const pairs = await (await fetch(DS+'/tokens/v1/solana/'+mints.slice(0,30).join(','))).json();
-  return normDS(pairs);
+    const raw = localStorage.getItem(MIG_KEY); if(!raw) return [];
+    return JSON.parse(raw).filter(t=>Date.now()-(t.seen||0) < MIG_TTL);
+  }catch(e){ return []; }
 }
 
-/* ---------------- flash helpers ---------------- */
-function flashOne(el, up){
-  el.classList.remove('fl-up','fl-down');
-  void el.offsetWidth;
-  el.classList.add(up?'fl-up':'fl-down');
+/* ---------------- rows ---------------- */
+function openToken(mint){
+  const t = known[mint]||{};
+  location.href = 'token.html?mint='+encodeURIComponent(mint)
+    +'&pair='+encodeURIComponent(t.pair||'')
+    +'&sym='+encodeURIComponent(t.symbol||'');
 }
-function flashCells(map){
-  for(const m in map){
-    const t = map[m];
-    const prevP = lastPrice[m], prevM = lastMc[m];
-    const pxUp = prevP!=null && t.priceUsd!==prevP ? t.priceUsd>prevP : null;
-    const mcUp = prevM!=null && t.mc && t.mc!==prevM ? t.mc>prevM : null;
-    fixMc(t);
-    document.querySelectorAll('[data-px="'+m+'"]').forEach(el=>{
-      const isMc = el.dataset.mode==='mc';
-      const moved = isMc ? (mcUp!=null?mcUp:pxUp) : pxUp;
-      if(moved!=null) flashOne(el, moved);
-      el.textContent = (isMc && t.mc>=MC_FLOOR) ? money(t.mc)+' MC'
-                     : (t.priceUsd>0 ? '$'+fmt(t.priceUsd) : '—');
-    });
-    document.querySelectorAll('[data-chg="'+m+'"]').forEach(el=>{
-      const v = t.chg1!=null?t.chg1:t.chg24;
-      if(v!=null && !isNaN(v)){
-        el.className = 'chg '+(v>=0?'pos-chg':'neg-chg');
-        el.textContent = (v>=0?'+':'')+fmt(v,1)+'%';
-      }
-    });
-    document.querySelectorAll('[data-prog="'+m+'"]').forEach(el=>{
-      if(t.progress!=null) el.style.width = Math.round(t.progress*100)+'%';
-    });
-    lastPrice[m]=t.priceUsd; if(t.mc) lastMc[m]=t.mc;
-  }
-}
-function localTick(){
-  document.querySelectorAll('[data-age]').forEach(el=>{ el.textContent = age(el.dataset.age); });
-  const el=$('#livedot');
-  if(el){ const s=(Date.now()-lastTick)/1000; el.classList.toggle('stale', s>15); el.title='Last update '+(s|0)+'s ago'; }
-}
-
-/* ---------------- trading ---------------- */
-function pnlTotals(){
-  let u=0; for(const m in S.positions){ const p=S.positions[m]; u += p.qty*(p.priceSol||0) - p.cost; }
-  return {unreal:u, total:u+S.realized};
-}
-function buyToken(t, amt){
-  amt = +amt;
-  if(!t) return;
-  if(!(amt>0)) return toast('Enter a SOL amount to buy.','err');
-  if(amt+NETFEE > cash()) return toast('Not enough SOL. Balance = your devnet SOL + trade PnL. Claim an airdrop first.','err');
-  if(!(t.priceSol>0)) return toast('No live price for '+esc(t.symbol)+' right now.','err');
-  const qty = amt*(1-FEE)/t.priceSol;
-  S.flow -= (amt+NETFEE);
-  const p = S.positions[t.mint] || {symbol:t.symbol,name:t.name,img:t.img,qty:0,cost:0,priceSol:t.priceSol,priceUsd:t.priceUsd,pair:t.pair};
-  p.qty += qty; p.cost += amt+NETFEE; p.priceSol=t.priceSol; p.priceUsd=t.priceUsd;
-  S.positions[t.mint]=p;
-  S.history.unshift({t:Date.now(),side:'BUY',sym:t.symbol,mint:t.mint,qty,sol:amt});
-  save(); renderDeck();
-  if(typeof onTrade==='function') onTrade();
-  toast('<b class="mono">BUY</b> '+fmt(qty)+' '+esc(t.symbol)+' for '+fmt(amt,4)+' SOL','ok');
-}
-function quickBuy(mint){ const t=known[mint]; if(t) buyToken(t, 0.1); }
-function sellPct(mint, pct){
-  const t = known[mint];
-  const p = S.positions[mint];
-  if(!p || !(p.qty>0)) return toast('No position here.','err');
-  const priceSol = (t&&t.priceSol) || p.priceSol;
-  if(!(priceSol>0)) return toast('No live price right now.','err');
-  const qty = p.qty * pct;
-  const gross = qty*priceSol, fee = gross*FEE, proceeds = gross-fee-NETFEE;
-  const costPart = p.cost*(qty/p.qty);
-  S.realized += proceeds - costPart;
-  S.flow += Math.max(proceeds,0);
-  p.qty -= qty; p.cost -= costPart;
-  if(p.qty < 1e-9) delete S.positions[mint];
-  S.history.unshift({t:Date.now(),side:'SELL',sym:p.symbol,mint,qty,sol:proceeds});
-  save(); renderDeck();
-  if(typeof onTrade==='function') onTrade();
-  toast('<b class="mono">SELL</b> '+fmt(qty)+' '+esc(p.symbol)+' → '+fmt(proceeds,4)+' SOL','ok');
-}
-
-/* ---------------- deck ---------------- */
-function renderDeck(){
-  const su=$('#solusd'); if(su) su.textContent = solUsd? '$'+fmt(solUsd,2) : '–';
-  const z=$('#walletzone'); if(!z) return;
-  if(!S.wallet){ z.innerHTML=''; return; }
-  const P=pnlTotals();
-  const col = P.total>=0?'var(--up)':'var(--down)';
-  const here = location.pathname.split('/').pop() || 'index.html';
-  z.innerHTML = `
-    <div id="walletchip">
-      <span id="livedot" class="livedot" title="Live"></span>
-      <div class="deck-stat"><span class="k">Devnet SOL</span><span class="v">${devnetBal==null?'…':fmt(devnetBal,3)}</span></div>
-      <div class="deck-stat"><span class="k">Buying power</span><span class="v">${fmt(cash(),3)}</span></div>
-      <div class="deck-stat"><span class="k">Total PnL</span><span class="v" style="color:${col}">${P.total>=0?'+':''}${fmt(P.total,3)}</span></div>
-      <a class="navlink ${here==='index.html'||here===''?'on':''}" href="index.html">Tokens</a>
-      <a class="navlink ${here==='portfolio.html'?'on':''}" href="portfolio.html">Portfolio</a>
-      <button class="btn-brand" id="airdropbtn" onclick="airdrop()">Claim 1 devnet SOL</button>
+function rowHTML(t){
+  const isNew = t._new && Date.now()-t._new<15000;
+  const prog = t.progress!=null
+    ? `<div class="prog"><div class="prog-fill" data-prog="${t.mint}" style="width:${Math.round(t.progress*100)}%"></div></div><div class="nm"><span data-progtxt="${t.mint}">${Math.round(t.progress*100)}%</span> to graduation · est.</div>`
+    : `<div class="nm">${esc(t.name||'')}</div>`;
+  return `
+    <div class="tok ${isNew?'newrow':''}" onclick="openToken('${t.mint}')">
+      <img data-img="${t.mint}" src="${esc(t.img||'')}" alt="" style="${t.img?'':'visibility:hidden'}" onerror="this.style.visibility='hidden'">
+      <div class="tokmid">
+        <div class="symrow"><span class="sym">${esc(t.symbol||'?')}</span>${t.created?`<span class="age" data-age="${esc(t.created)}">${age(t.created)}</span>`:''}</div>
+        ${prog}
+      </div>
+      <div class="tokright">
+        <div class="px" data-px="${t.mint}" data-mode="mc">${t.mc?money(t.mc)+' MC':(t.priceUsd?'$'+fmt(t.priceUsd):'—')}</div>
+        <span data-chg="${t.mint}">${chgCell(t.chg1!=null?t.chg1:t.chg24)}</span>
+      </div>
+      <button class="quick" title="Quick buy 0.1 SOL" onclick="event.stopPropagation();quickBuy('${t.mint}')">⚡.1</button>
     </div>`;
 }
-function requireWallet(){
-  if(!S.wallet){ location.href='index.html'; return false; }
-  return true;
+function renderCol(key){
+  const el=$('#col-'+key); if(!el) return;
+  const st = el.scrollTop;
+  el.innerHTML = cols[key].map(rowHTML).join('') || '<div class="skel">Waiting for the chain…</div>';
+  el.scrollTop = st;
+  const c=$('#count-'+key); if(c) c.textContent = cols[key].length;
+}
+function pushCol(key, t){
+  cols[key] = [t, ...cols[key].filter(x=>x.mint!==t.mint)].slice(0, CAP[key]);
+  renderCol(key);
 }
 
-/* ================================================================
-   Real-time engine · PumpPortal public websocket (no key)
-   Streams: token creations, per-trade ticks, migrations
-   ================================================================ */
-let ws=null, wsWant={new:false,mig:false}, wsTradeKeys=new Set();
-let wsOn={create:null,trade:null,migrate:null};
-function wsSend(o){ try{ if(ws&&ws.readyState===1) ws.send(JSON.stringify(o)); }catch(e){} }
-function wsConnect(){
-  try{ ws = new WebSocket('wss://pumpportal.fun/api/data'); }catch(e){ return; }
-  ws.onopen = ()=>{
-    lastTick=Date.now();
-    if(wsWant.new) wsSend({method:'subscribeNewToken'});
-    if(wsWant.mig) wsSend({method:'subscribeMigration'});
-    if(wsTradeKeys.size) wsSend({method:'subscribeTokenTrade', keys:[...wsTradeKeys]});
-  };
-  ws.onmessage = ev=>{
-    let d; try{ d=JSON.parse(ev.data); }catch(e){ return; }
-    if(!d || !d.txType) return;
-    lastTick=Date.now();
-    if(d.txType==='create'){ if(wsOn.create) wsOn.create(d); }
-    else if(d.txType==='buy'||d.txType==='sell'){ if(wsOn.trade) wsOn.trade(d); }
-    else if(/migrat/i.test(d.txType)){ if(wsOn.migrate) wsOn.migrate(d); }
-  };
-  ws.onclose = ()=>{ setTimeout(wsConnect, 3000); };
-  ws.onerror = ()=>{ try{ ws.close(); }catch(e){} };
+/* ---------------- live stream handlers ---------------- */
+function onCreate(d){
+  const t = ppApply(d); if(!t) return;
+  t.created = t.created || new Date().toISOString();
+  ppImage(t, d.uri);
+  wsSubTrades([t.mint]);                 // watch every mint for its first real bids
+  if(t.mc >= NEW_MIN_MC){ t._new = Date.now(); pushCol('new', t); return; }
+  pending.set(t.mint, t);
+  if(pending.size > 400){                // keep the watchlist bounded
+    const oldest = [...pending.keys()].slice(0, pending.size - 400);
+    oldest.forEach(k=>pending.delete(k));
+  }
 }
-function wsSubNew(fn){ wsWant.new=true; wsOn.create=fn; wsSend({method:'subscribeNewToken'}); }
-function wsSubMig(fn){ wsWant.mig=true; wsOn.migrate=fn; wsSend({method:'subscribeMigration'}); }
-function wsSubTrades(mints, fn){
-  if(fn) wsOn.trade=fn;
-  const add=(mints||[]).filter(m=>m && !wsTradeKeys.has(m));
-  add.forEach(m=>wsTradeKeys.add(m));
-  if(add.length) wsSend({method:'subscribeTokenTrade', keys:add});
+function onMigrate(d){
+  const t = ppApply(d) || known[d.mint]; if(!t) return;
+  t._new = Date.now();
+  t.created = new Date().toISOString();
+  t.progress = null; t.dex = 'pumpswap';
+  if(t.mc && t.mc < MIG_MIN_MC) t.mc = null;   // don't display drained-curve junk
+  t.seen = Date.now();
+  pushCol('done', t); saveMigrated();
+  cols.grad = cols.grad.filter(x=>x.mint!==t.mint); renderCol('grad');
+  cols.new  = cols.new.filter(x=>x.mint!==t.mint);  renderCol('new');
+  const verify = async()=>{ try{ const f=remember(await fetchMints([t.mint])); if(f[0]&&f[0].mc>=MIG_MIN_MC){ Object.assign(t,f[0]); renderCol('done'); } }catch(e){} };
+  setTimeout(verify, 6000); setTimeout(verify, 20000);
 }
-/* map a pumpportal message onto our token model */
-function ppApply(d){
-  const m=d.mint; if(!m) return null;
-  const t = known[m] = known[m] || {mint:m, symbol:d.symbol||'?', name:d.name||'', img:'', pair:d.bondingCurveKey||'', dex:'pump-fun', src:'ws'};
-  if(d.symbol) t.symbol=d.symbol;
-  if(d.name) t.name=d.name;
-  if(!t.pair && d.bondingCurveKey) t.pair=d.bondingCurveKey;
-  const vS=+d.vSolInBondingCurve, vT=+d.vTokensInBondingCurve;
-  if(vS>0) t.vSol = vS;
-  if(vS>0 && vT>0) t.priceSol = vS/vT;
-  if(t.priceSol && solUsd) t.priceUsd = t.priceSol*solUsd;
-  const mcSol = +d.marketCapSol;
-  if(mcSol > 1){ t.mcSol = mcSol; if(solUsd) t.mc = mcSol*solUsd; }
-  fixMc(t);
-  return t;
+function onTradeTick(d){
+  const t = ppApply(d); if(!t) return;
+  const map={}; map[t.mint]=t;
+  flashCells(map);
+  const pt=document.querySelector('[data-progtxt="'+t.mint+'"]');
+  if(pt && t.progress!=null) pt.textContent = Math.round(t.progress*100)+'%';
+  // crossed the New Pairs floor: it just earned a slot
+  if(pending.has(t.mint) && t.mc >= NEW_MIN_MC){
+    pending.delete(t.mint);
+    t._new = Date.now();
+    pushCol('new', t);
+  }
+  // live promotion: crossed the graduation-run threshold -> Final Stretch
+  if(t.progress!=null && t.progress>=GRAD_MIN && !cols.grad.find(x=>x.mint===t.mint)){
+    t._new = Date.now();
+    cols.new = cols.new.filter(x=>x.mint!==t.mint); renderCol('new');
+    cols.grad = [t, ...cols.grad.filter(x=>x.mint!==t.mint)]
+                  .sort((a,b)=>(b.progress||0)-(a.progress||0)).slice(0,CAP.grad);
+    renderCol('grad');
+  }
+  if(S.positions[t.mint]){ S.positions[t.mint].priceSol=t.priceSol; S.positions[t.mint].priceUsd=t.priceUsd; renderDeck(); }
 }
-/* lazy-load a new token's image from its metadata uri */
-function ppImage(t, uri){
-  if(!uri || t.img) return;
-  fetch(uri.replace('ipfs://','https://ipfs.io/ipfs/')).then(r=>r.json()).then(j=>{
-    if(j && j.image){
-      t.img = j.image.replace('ipfs://','https://ipfs.io/ipfs/');
-      document.querySelectorAll('img[data-img="'+t.mint+'"]').forEach(el=>{ el.src=t.img; el.style.visibility='visible'; });
-    }
-  }).catch(()=>{});
+
+/* ---------------- seeding + backfill ---------------- */
+async function seed(){
+  const cached = remember(loadMigrated());
+  if(cached.length){ cols.done = cached.slice(0,CAP.done); renderCol('done'); }
+  await ensureSolUsd();
+  const jobs = [
+    loadNew().then(r=>{
+      if(!cols.new.length){
+        cols.new = r.filter(t=>t.mc >= NEW_MIN_MC).slice(0,CAP.new);
+        renderCol('new');
+      }
+    }).catch(()=>{}),
+    loadGraduating().then(r=>{
+      cols.grad = r.filter(t=>t.progress>=GRAD_MIN)
+                   .sort((a,b)=>(b.progress||0)-(a.progress||0))
+                   .slice(0,CAP.grad);
+      renderCol('grad');
+    }).catch(()=>{}),
+    loadGraduated().then(async r=>{
+      const needFix = r.filter(t=>!t.mc || t.mc<MIG_MIN_MC).map(t=>t.mint);
+      if(needFix.length){
+        try{
+          const fixed = remember(await fetchMints(needFix));
+          const fm={}; fixed.forEach(t=>fm[t.mint]=t);
+          r = r.map(t=>fm[t.mint]?Object.assign(t,fm[t.mint]):t);
+        }catch(e){}
+      }
+      const fresh = r.filter(t=>t.mc>=MIG_MIN_MC);
+      const merged = [], seen = {};
+      [...fresh, ...remember(loadMigrated())].forEach(t=>{
+        if(seen[t.mint]) return;
+        seen[t.mint]=1; t.seen = t.seen||Date.now(); merged.push(t);
+      });
+      cols.done = merged.sort((a,b)=>new Date(b.created)-new Date(a.created)).slice(0,CAP.done);
+      renderCol('done'); saveMigrated();
+      wsSubTrades(cols.done.map(t=>t.mint));
+    }).catch(()=>{})
+  ];
+  await Promise.all(jobs);
+  remember([...cols.new,...cols.grad,...cols.done]);
+  wsSubTrades([...cols.new,...cols.grad,...cols.done].map(t=>t.mint), onTradeTick);
 }
-async function ensureSolUsd(){
-  if(solUsd) return;
+async function backfill(){
   try{
-    const p = await (await fetch(DS+'/tokens/v1/solana/So11111111111111111111111111111111111111112')).json();
-    const g = (p||[]).find(x=>+x.priceUsd>0);
-    if(g) solUsd = +g.priceUsd;
+    const r = remember(await loadGraduating()).filter(t=>t.progress>=GRAD_MIN);
+    const fresh = {}; r.forEach(t=>fresh[t.mint]=t);
+    // update rows we already show (no flicker), keep them if they briefly drop out
+    cols.grad.forEach(t=>{ if(fresh[t.mint]) mergeToken(t, fresh[t.mint]); });
+    const have = new Set(cols.grad.map(t=>t.mint));
+    const added = r.filter(t=>!have.has(t.mint));
+    cols.grad = [...cols.grad, ...added]
+      .sort((a,b)=>(b.progress||0)-(a.progress||0))
+      .slice(0, CAP.grad);
+    renderCol('grad'); wsSubTrades(cols.grad.map(t=>t.mint));
   }catch(e){}
 }
+async function pollPrices(){
+  if(priceBusy) return; priceBusy=true;
+  try{
+    const need = new Set(Object.keys(S.positions));
+    cols.done.forEach(t=>need.add(t.mint));   // migrated pools only; curve tokens come from GT/stream
+    if(need.size){
+      const fresh = remember(await fetchMints([...need].slice(0,30)));
+      const map={}; fresh.forEach(t=>map[t.mint]=t);
+      for(const m in S.positions){ if(map[m]){ S.positions[m].priceSol=map[m].priceSol; S.positions[m].priceUsd=map[m].priceUsd; } }
+      cols.done.forEach(t=>{ if(map[t.mint]) mergeToken(t, map[t.mint]); });
+      flashCells(map);
+      renderCol('done'); saveMigrated();
+      renderDeck();
+    }
+  }catch(e){}
+  priceBusy=false;
+}
+
+/* ---------------- search overlay ---------------- */
+async function doSearch(){
+  const q=$('#q').value.trim(); if(!q) return;
+  searching=true;
+  $('#pulse').style.display='none';
+  $('#searchres').style.display='block';
+  $('#searchlist').innerHTML='<div class="skel">Searching…</div>';
+  try{
+    const res = remember(/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(q) ? await fetchMints([q]) : await fetchSearch(q));
+    $('#searchlist').innerHTML = res.map(rowHTML).join('') || '<div class="skel">No results.</div>';
+  }catch(e){ $('#searchlist').innerHTML='<div class="skel">Search failed: '+esc(e.message)+'</div>'; }
+}
+function closeSearch(){ searching=false; $('#searchres').style.display='none'; $('#pulse').style.display='grid'; $('#q').value=''; }
+function onTrade(){ /* deck handled in core */ }
+
+/* ---------------- shell ---------------- */
+function renderOnboard(){
+  $('#feedwrap').innerHTML = `
+    <div id="onboard"><div class="ob-card">
+      <h1>Practice like it's <b>real.</b></h1>
+      <p>Trade live Solana memecoins with devnet SOL. Real market data streaming straight from pump.fun, real wallet, zero real money.</p>
+      <div class="ob-steps">
+        <div><b>01</b> Generate your practice wallet — one address, yours to keep</div>
+        <div><b>02</b> Claim free devnet SOL from the faucet</div>
+        <div><b>03</b> Watch new pairs stream in live and trade them with simulated fills</div>
+      </div>
+      <button class="btn-brand" style="padding:.8rem 1.6rem;font-size:1rem" onclick="makeWallet();boot();toast('Wallet created and saved to this browser. Export the key from the Portfolio page to back it up. Never send real SOL to it.','ok')">Generate practice wallet</button>
+      <p style="font-size:.75rem;margin-top:1rem">Already have a DryRun key? <a href="javascript:importKey()" style="color:var(--brand2)">Import wallet</a></p>
+    </div></div>`;
+}
+function renderPulseShell(){
+  $('#feedwrap').innerHTML = `
+    <div class="pulsebar">
+      <h2 style="font-size:1rem;margin:0">Pulse</h2>
+      <div style="flex:1"></div>
+      <input id="q" style="max-width:300px" placeholder="Name, symbol, or mint address" onkeydown="if(event.key==='Enter')doSearch()">
+      <button class="btn-ghost" onclick="doSearch()">Go</button>
+    </div>
+    <div id="searchres" style="display:none">
+      <section class="panel wide">
+        <div class="panel-h"><h3>Search results</h3><button class="btn-ghost" style="margin-left:auto;font-size:.7rem;padding:.3rem .6rem" onclick="closeSearch()">← Back to Pulse</button></div>
+        <div class="panel-b" style="padding:0"><div id="searchlist"></div></div>
+      </section>
+    </div>
+    <div class="pulse" id="pulse">
+      <section class="panel pulse-col">
+        <div class="panel-h"><h3>New Pairs</h3><span class="colcount" id="count-new">0</span><span class="livedot" style="margin-left:auto"></span></div>
+        <div class="panel-b colbody" id="col-new"><div class="skel">Connecting to pump.fun stream…</div></div>
+      </section>
+      <section class="panel pulse-col">
+        <div class="panel-h"><h3>Final Stretch</h3><span class="colcount" id="count-grad">0</span></div>
+        <div class="panel-b colbody" id="col-grad"><div class="skel">Loading…</div></div>
+      </section>
+      <section class="panel pulse-col">
+        <div class="panel-h"><h3>Migrated</h3><span class="colcount" id="count-done">0</span><span class="livedot" style="margin-left:auto"></span></div>
+        <div class="panel-b colbody" id="col-done"><div class="skel">Loading…</div></div>
+      </section>
+    </div>`;
+}
+function boot(){
+  if(!S.wallet){ renderOnboard(); renderDeck(); return; }
+  renderPulseShell(); renderDeck();
+  refreshBalance();
+  wsConnect();
+  wsSubNew(onCreate);
+  wsSubMig(onMigrate);
+  wsOn.trade = onTradeTick;
+  seed();
+}
+(async function(){
+  await loadState();
+  boot();
+  setInterval(backfill, 45000);
+  setInterval(pollPrices, 5000);
+  setInterval(localTick, 1000);
+  setInterval(refreshBalance, 30000);
+})();
